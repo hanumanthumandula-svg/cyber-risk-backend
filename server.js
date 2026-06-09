@@ -84,31 +84,81 @@ function checkHeaders(domain) {
   });
 }
 
+// ─── Helper: validate and classify input ─────────────────────────────────────
+function classifyTarget(input) {
+  const ipv4Regex = /^(\d{1,3}\.){3}\d{1,3}$/;
+  const domainRegex = /^([a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}$/;
+
+  if (ipv4Regex.test(input)) {
+    const parts = input.split('.').map(Number);
+    if (parts.some(n => n > 255)) return { valid: false };
+
+    // Block private/reserved IPs (SSRF protection)
+    const isPrivate =
+      parts[0] === 10 ||
+      parts[0] === 127 ||
+      parts[0] === 0 ||
+      (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) ||
+      (parts[0] === 192 && parts[1] === 168) ||
+      (parts[0] === 169 && parts[1] === 254);
+
+    if (isPrivate) return { valid: false, private: true };
+    return { valid: true, type: 'ip' };
+  }
+
+  if (domainRegex.test(input)) return { valid: true, type: 'domain' };
+
+  return { valid: false };
+}
+
 // ─── Main scan endpoint ───────────────────────────────────────────────────────
 app.post('/api/scan', async (req, res) => {
   const { domain } = req.body;
-  if (!domain) return res.status(400).json({ error: 'Domain is required' });
+  if (!domain) return res.status(400).json({ error: 'Domain or IP address is required' });
 
-  const cleanDomain = domain.replace(/^https?:\/\//, '').replace(/\/.*$/, '').trim();
+  const cleanTarget = domain.replace(/^https?:\/\//, '').replace(/\/.*$/, '').trim();
+
+  // Validate input
+  const classification = classifyTarget(cleanTarget);
+  if (!classification.valid) {
+    if (classification.private) {
+      return res.status(400).json({ error: 'Private or reserved IP addresses cannot be scanned' });
+    }
+    return res.status(400).json({ error: 'Invalid domain name or IP address' });
+  }
+
+  const isIP = classification.type === 'ip';
 
   try {
-    // 1. DNS lookup
+    // 1. DNS lookup (for domains) or reverse DNS (for IPs)
     let dnsResult = { resolved: false, ips: [], mx: [], txt: [] };
     try {
-      const ips = await dns.resolve4(cleanDomain);
-      dnsResult.resolved = true;
-      dnsResult.ips = ips;
-      try { dnsResult.mx = await dns.resolveMx(cleanDomain); } catch {}
-      try { dnsResult.txt = await dns.resolveTxt(cleanDomain); } catch {}
+      if (isIP) {
+        // For IPs: treat the IP itself as resolved, attempt reverse DNS
+        dnsResult.resolved = true;
+        dnsResult.ips = [cleanTarget];
+        try {
+          const hostnames = await dns.reverse(cleanTarget);
+          dnsResult.hostname = hostnames[0] || null;
+        } catch {
+          dnsResult.hostname = null;
+        }
+      } else {
+        const ips = await dns.resolve4(cleanTarget);
+        dnsResult.resolved = true;
+        dnsResult.ips = ips;
+        try { dnsResult.mx = await dns.resolveMx(cleanTarget); } catch {}
+        try { dnsResult.txt = await dns.resolveTxt(cleanTarget); } catch {}
+      }
     } catch (e) {
-      dnsResult.error = 'Domain could not be resolved';
+      dnsResult.error = 'Could not resolve target';
     }
 
     // 2. SSL check
-    const sslResult = await checkSSL(cleanDomain);
+    const sslResult = await checkSSL(cleanTarget);
 
     // 3. HTTP headers
-    const headerResult = await checkHeaders(cleanDomain);
+    const headerResult = await checkHeaders(cleanTarget);
 
     // 4. Port scan (common ports)
     const portsToCheck = [
@@ -129,7 +179,7 @@ app.post('/api/scan', async (req, res) => {
     const portResults = await Promise.all(
       portsToCheck.map(async (p) => ({
         ...p,
-        open: await checkPort(cleanDomain, p.port)
+        open: await checkPort(cleanTarget, p.port)
       }))
     );
     const openPorts = portResults.filter(p => p.open);
@@ -149,18 +199,19 @@ app.post('/api/scan', async (req, res) => {
     if (missingHeaders.length > 0) findings.push({ type: 'Headers', severity: 'Medium', detail: `Missing security headers: ${missingHeaders.join(', ')}` });
 
     openPorts.forEach(p => {
-      if (['Critical'].includes(p.risk)) { score -= 15; findings.push({ type: 'Port', severity: 'Critical', detail: `Dangerous port open: ${p.port} (${p.name})` }); }
+      if (p.risk === 'Critical') { score -= 15; findings.push({ type: 'Port', severity: 'Critical', detail: `Dangerous port open: ${p.port} (${p.name})` }); }
       else if (p.risk === 'High') { score -= 8; findings.push({ type: 'Port', severity: 'High', detail: `Risky port open: ${p.port} (${p.name})` }); }
       else if (p.risk === 'Medium') { score -= 4; findings.push({ type: 'Port', severity: 'Medium', detail: `Port open: ${p.port} (${p.name})` }); }
     });
 
-    if (!dnsResult.resolved) { score -= 20; findings.push({ type: 'DNS', severity: 'Critical', detail: 'Domain could not be resolved' }); }
+    if (!dnsResult.resolved) { score -= 20; findings.push({ type: 'DNS', severity: 'Critical', detail: 'Target could not be resolved' }); }
 
     score = Math.max(0, score);
     const riskLevel = score >= 80 ? 'Low' : score >= 60 ? 'Medium' : score >= 40 ? 'High' : 'Critical';
 
     const scanResult = {
-      domain: cleanDomain,
+      domain: cleanTarget,
+      targetType: isIP ? 'ip' : 'domain',
       scannedAt: new Date().toISOString(),
       score,
       riskLevel,
