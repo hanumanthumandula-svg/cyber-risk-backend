@@ -1,6 +1,10 @@
 const express = require('express');
 const mongoose = require('mongoose');
 const cors = require('cors');
+const dns = require('dns').promises;
+const net = require('net');
+const https = require('https');
+const http = require('http');
 require('dotenv').config();
 
 const app = express();
@@ -13,76 +17,183 @@ mongoose.connect(process.env.MONGO_URI)
 
 app.use('/api/assessment', require('./routes/assessment'));
 
-app.post('/api/ai-analyze', async (req, res) => {
-  try {
-    const { companyName, industry } = req.body;
-    const prompt = `You are a cybersecurity expert. Generate a complete cybersecurity risk assessment report for the following organization:
-
-Company Name: ${companyName}
-Industry: ${industry}
-
-Generate a detailed JSON report with EXACTLY this structure and nothing else:
-{
-  "companyName": "${companyName}",
-  "industry": "${industry}",
-  "overallRiskScore": <number 0-100>,
-  "riskLevel": "<Low|Medium|High|Critical>",
-  "executiveSummary": "<2-3 sentence summary>",
-  "threats": [
-    {"name": "<threat name>", "severity": "<Low|Medium|High|Critical>", "description": "<one line>"},
-    {"name": "<threat name>", "severity": "<Low|Medium|High|Critical>", "description": "<one line>"},
-    {"name": "<threat name>", "severity": "<Low|Medium|High|Critical>", "description": "<one line>"},
-    {"name": "<threat name>", "severity": "<Low|Medium|High|Critical>", "description": "<one line>"},
-    {"name": "<threat name>", "severity": "<Low|Medium|High|Critical>", "description": "<one line>"}
-  ],
-  "domains": [
-    {"name": "Patch Management", "score": <0-10>, "status": "<Weak|Moderate|Strong>", "recommendation": "<one line fix>"},
-    {"name": "MFA & Authentication", "score": <0-10>, "status": "<Weak|Moderate|Strong>", "recommendation": "<one line fix>"},
-    {"name": "Monitoring & Detection", "score": <0-10>, "status": "<Weak|Moderate|Strong>", "recommendation": "<one line fix>"},
-    {"name": "Backup & Recovery", "score": <0-10>, "status": "<Weak|Moderate|Strong>", "recommendation": "<one line fix>"},
-    {"name": "Access Control", "score": <0-10>, "status": "<Weak|Moderate|Strong>", "recommendation": "<one line fix>"},
-    {"name": "Security Awareness", "score": <0-10>, "status": "<Weak|Moderate|Strong>", "recommendation": "<one line fix>"},
-    {"name": "Encryption", "score": <0-10>, "status": "<Weak|Moderate|Strong>", "recommendation": "<one line fix>"},
-    {"name": "Incident Response", "score": <0-10>, "status": "<Weak|Moderate|Strong>", "recommendation": "<one line fix>"}
-  ],
-  "compliance": [
-    {"framework": "ISO 27001", "status": "<Compliant|Partial|Non-Compliant>", "gap": "<one line>"},
-    {"framework": "NIST CSF", "status": "<Compliant|Partial|Non-Compliant>", "gap": "<one line>"},
-    {"framework": "PCI DSS", "status": "<Compliant|Partial|Non-Compliant>", "gap": "<one line>"},
-    {"framework": "GDPR", "status": "<Compliant|Partial|Non-Compliant>", "gap": "<one line>"}
-  ],
-  "topRecommendations": [
-    "<recommendation 1>",
-    "<recommendation 2>",
-    "<recommendation 3>",
-    "<recommendation 4>",
-    "<recommendation 5>"
-  ]
+// ─── Helper: check single port ───────────────────────────────────────────────
+function checkPort(host, port, timeout = 3000) {
+  return new Promise((resolve) => {
+    const socket = new net.Socket();
+    socket.setTimeout(timeout);
+    socket.on('connect', () => { socket.destroy(); resolve(true); });
+    socket.on('timeout', () => { socket.destroy(); resolve(false); });
+    socket.on('error', () => resolve(false));
+    socket.connect(port, host);
+  });
 }
 
-Return ONLY the JSON. No explanation. No markdown. No extra text.`;
+// ─── Helper: check SSL ───────────────────────────────────────────────────────
+function checkSSL(domain) {
+  return new Promise((resolve) => {
+    const options = { host: domain, port: 443, method: 'HEAD', rejectUnauthorized: false };
+    const req = https.request(options, (res) => {
+      const cert = res.socket.getPeerCertificate();
+      if (!cert || !cert.valid_to) return resolve({ valid: false, error: 'No certificate found' });
+      const expiry = new Date(cert.valid_to);
+      const now = new Date();
+      const daysLeft = Math.floor((expiry - now) / (1000 * 60 * 60 * 24));
+      resolve({
+        valid: true,
+        subject: cert.subject?.CN || domain,
+        issuer: cert.issuer?.O || 'Unknown',
+        validTo: cert.valid_to,
+        daysLeft,
+        expired: daysLeft < 0,
+        expiringSoon: daysLeft < 30 && daysLeft >= 0
+      });
+    });
+    req.on('error', () => resolve({ valid: false, error: 'SSL connection failed' }));
+    req.end();
+  });
+}
 
-    const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+// ─── Helper: check HTTP headers ──────────────────────────────────────────────
+function checkHeaders(domain) {
+  return new Promise((resolve) => {
+    const options = { host: domain, path: '/', method: 'HEAD', timeout: 5000 };
+    const req = https.request({ ...options, port: 443 }, (res) => {
+      const headers = res.headers;
+      const httpsRedirect = true;
+      resolve({
+        statusCode: res.statusCode,
+        httpsRedirect,
+        headers: {
+          'strict-transport-security': !!headers['strict-transport-security'],
+          'x-frame-options': !!headers['x-frame-options'],
+          'x-content-type-options': !!headers['x-content-type-options'],
+          'content-security-policy': !!headers['content-security-policy'],
+          'x-xss-protection': !!headers['x-xss-protection'],
+          'referrer-policy': !!headers['referrer-policy'],
+          'permissions-policy': !!headers['permissions-policy']
+        }
+      });
+    });
+    req.on('error', () => {
+      http.get(`http://${domain}`, (res) => {
+        resolve({ statusCode: res.statusCode, httpsRedirect: false, headers: {} });
+      }).on('error', () => resolve({ statusCode: null, httpsRedirect: false, headers: {} }));
+    });
+    req.end();
+  });
+}
+
+// ─── Main scan endpoint ───────────────────────────────────────────────────────
+app.post('/api/scan', async (req, res) => {
+  const { domain } = req.body;
+  if (!domain) return res.status(400).json({ error: 'Domain is required' });
+
+  const cleanDomain = domain.replace(/^https?:\/\//, '').replace(/\/.*$/, '').trim();
+
+  try {
+    // 1. DNS lookup
+    let dnsResult = { resolved: false, ips: [], mx: [], txt: [] };
+    try {
+      const ips = await dns.resolve4(cleanDomain);
+      dnsResult.resolved = true;
+      dnsResult.ips = ips;
+      try { dnsResult.mx = await dns.resolveMx(cleanDomain); } catch {}
+      try { dnsResult.txt = await dns.resolveTxt(cleanDomain); } catch {}
+    } catch (e) {
+      dnsResult.error = 'Domain could not be resolved';
+    }
+
+    // 2. SSL check
+    const sslResult = await checkSSL(cleanDomain);
+
+    // 3. HTTP headers
+    const headerResult = await checkHeaders(cleanDomain);
+
+    // 4. Port scan (common ports)
+    const portsToCheck = [
+      { port: 21, name: 'FTP', risk: 'High' },
+      { port: 22, name: 'SSH', risk: 'Medium' },
+      { port: 23, name: 'Telnet', risk: 'Critical' },
+      { port: 25, name: 'SMTP', risk: 'Medium' },
+      { port: 80, name: 'HTTP', risk: 'Low' },
+      { port: 443, name: 'HTTPS', risk: 'Low' },
+      { port: 3306, name: 'MySQL', risk: 'Critical' },
+      { port: 5432, name: 'PostgreSQL', risk: 'Critical' },
+      { port: 6379, name: 'Redis', risk: 'Critical' },
+      { port: 27017, name: 'MongoDB', risk: 'Critical' },
+      { port: 8080, name: 'HTTP-Alt', risk: 'Medium' },
+      { port: 8443, name: 'HTTPS-Alt', risk: 'Low' }
+    ];
+
+    const portResults = await Promise.all(
+      portsToCheck.map(async (p) => ({
+        ...p,
+        open: await checkPort(cleanDomain, p.port)
+      }))
+    );
+    const openPorts = portResults.filter(p => p.open);
+
+    // 5. Calculate risk score
+    let score = 100;
+    const findings = [];
+
+    if (!sslResult.valid) { score -= 25; findings.push({ type: 'SSL', severity: 'Critical', detail: 'No valid SSL certificate' }); }
+    else if (sslResult.expired) { score -= 25; findings.push({ type: 'SSL', severity: 'Critical', detail: 'SSL certificate has expired' }); }
+    else if (sslResult.expiringSoon) { score -= 10; findings.push({ type: 'SSL', severity: 'High', detail: `SSL expires in ${sslResult.daysLeft} days` }); }
+
+    if (!headerResult.httpsRedirect) { score -= 10; findings.push({ type: 'HTTPS', severity: 'High', detail: 'No HTTPS redirect from HTTP' }); }
+
+    const missingHeaders = Object.entries(headerResult.headers || {}).filter(([, v]) => !v).map(([k]) => k);
+    score -= missingHeaders.length * 3;
+    if (missingHeaders.length > 0) findings.push({ type: 'Headers', severity: 'Medium', detail: `Missing security headers: ${missingHeaders.join(', ')}` });
+
+    openPorts.forEach(p => {
+      if (['Critical'].includes(p.risk)) { score -= 15; findings.push({ type: 'Port', severity: 'Critical', detail: `Dangerous port open: ${p.port} (${p.name})` }); }
+      else if (p.risk === 'High') { score -= 8; findings.push({ type: 'Port', severity: 'High', detail: `Risky port open: ${p.port} (${p.name})` }); }
+      else if (p.risk === 'Medium') { score -= 4; findings.push({ type: 'Port', severity: 'Medium', detail: `Port open: ${p.port} (${p.name})` }); }
+    });
+
+    if (!dnsResult.resolved) { score -= 20; findings.push({ type: 'DNS', severity: 'Critical', detail: 'Domain could not be resolved' }); }
+
+    score = Math.max(0, score);
+    const riskLevel = score >= 80 ? 'Low' : score >= 60 ? 'Medium' : score >= 40 ? 'High' : 'Critical';
+
+    const scanResult = {
+      domain: cleanDomain,
+      scannedAt: new Date().toISOString(),
+      score,
+      riskLevel,
+      findings,
+      ssl: sslResult,
+      headers: headerResult,
+      ports: { open: openPorts, all: portResults },
+      dns: dnsResult
+    };
+
+    res.json(scanResult);
+
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ─── AI analyze endpoint ──────────────────────────────────────────────────────
+app.post('/api/ai-analyze', async (req, res) => {
+  try {
+    const response = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'Authorization': `Bearer ${process.env.GROQ_API_KEY}`
+        'x-api-key': process.env.ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01'
       },
-      body: JSON.stringify({
-        model: 'llama-3.3-70b-versatile',
-        messages: [{ role: 'user', content: prompt }],
-        max_tokens: 2000,
-        temperature: 0.3
-      })
+      body: JSON.stringify(req.body)
     });
-
     const data = await response.json();
-    const raw = data.choices[0].message.content;
-    const clean = raw.replace(/```json|```/g, '').trim();
-    const report = JSON.parse(clean);
-    res.json({ success: true, report });
+    res.json(data);
   } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({ error: error.message });
   }
 });
 
@@ -91,6 +202,4 @@ app.get('/', (req, res) => {
 });
 
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
