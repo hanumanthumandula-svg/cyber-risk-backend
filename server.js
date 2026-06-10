@@ -232,22 +232,42 @@ app.post('/api/scan', async (req, res) => {
 // ─── AI analyze endpoint ──────────────────────────────────────────────────────
 app.post('/api/ai-analyze', async (req, res) => {
   try {
-    const response = await fetch('https://api.anthropic.com/v1/messages', {
+    const { messages } = req.body;
+
+    // Support both Anthropic format {messages} and direct body
+    const msgArray = messages || req.body.messages;
+
+    const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'x-api-key': process.env.ANTHROPIC_API_KEY,
-        'anthropic-version': '2023-06-01'
+        'Authorization': `Bearer ${process.env.GROQ_API_KEY}`
       },
-      body: JSON.stringify(req.body)
+      body: JSON.stringify({
+        model: 'llama-3.3-70b-versatile',
+        messages: msgArray,
+        max_tokens: 1000,
+        temperature: 0.7
+      })
     });
+
     const data = await response.json();
-    res.json(data);
+
+    if (!response.ok) {
+      console.error('Groq Error:', data);
+      return res.status(response.status).json({ error: data.error?.message || 'Groq API Error' });
+    }
+
+    // Convert Groq response to Anthropic format so frontend works without changes
+    res.json({
+      content: [{ text: data.choices[0].message.content }]
+    });
+
   } catch (error) {
+    console.error('AI Error:', error);
     res.status(500).json({ error: error.message });
   }
 });
-
 app.get('/', (req, res) => {
   res.json({ message: 'Cyber Risk Tool API is running' });
 });
