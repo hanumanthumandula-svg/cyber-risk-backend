@@ -13,29 +13,14 @@ app.use(cors({ origin: '*' }));
 app.use(express.json());
 
 // ── Email transporter ────────────────────────────────────────────────────────
-const dns = require('dns')
-
-dns.setDefaultResultOrder('ipv4first')
-
 const transporter = nodemailer.createTransport({
-  host: 'smtp.gmail.com',
-  port: 587,
-  secure: false,
-  requireTLS: true,
-  family: 4,
+  service: 'gmail',
   auth: {
     user: process.env.EMAIL_USER,
     pass: process.env.EMAIL_PASS
   }
-})
+});
 
-transporter.verify((error, success) => {
-  if (error) {
-    console.error('SMTP Error:', error)
-  } else {
-    console.log('SMTP Ready')
-  }
-})
 // ── MongoDB ──────────────────────────────────────────────────────────────────
 mongoose.connect(process.env.MONGO_URI)
   .then(() => console.log('MongoDB Connected'))
