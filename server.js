@@ -1,7 +1,7 @@
 const express = require('express');
 const mongoose = require('mongoose');
 const cors = require('cors');
-const dns = require('dns').promises;
+const dnsPromises = require('dns').promises;
 const net = require('net');
 const https = require('https');
 const http = require('http');
@@ -12,23 +12,26 @@ const app = express();
 app.use(cors({ origin: '*' }));
 app.use(express.json());
 
-// ── Email transporter ────────────────────────────────────────────────────────
+// ── Email transporter ──────────────────────────────────────────────────────
 const transporter = nodemailer.createTransport({
-  service: 'gmail',
+  host: 'smtp.gmail.com',
+  port: 587,
+  secure: false,
   auth: {
     user: process.env.EMAIL_USER,
     pass: process.env.EMAIL_PASS
-  }
+  },
+  tls: { rejectUnauthorized: false }
 });
 
-// ── MongoDB ──────────────────────────────────────────────────────────────────
+// ── MongoDB ────────────────────────────────────────────────────────────────
 mongoose.connect(process.env.MONGO_URI)
   .then(() => console.log('MongoDB Connected'))
   .catch(err => console.log('MongoDB Error:', err));
 
 app.use('/api/assessment', require('./routes/assessment'));
 
-// ── Schemas ──────────────────────────────────────────────────────────────────
+// ── Schemas ────────────────────────────────────────────────────────────────
 const scanHistorySchema = new mongoose.Schema({
   domain: String,
   targetType: String,
@@ -47,7 +50,7 @@ const blockedUrlSchema = new mongoose.Schema({
 });
 const BlockedUrl = mongoose.model('BlockedUrl', blockedUrlSchema);
 
-// ── Helper: port check ───────────────────────────────────────────────────────
+// ── Helper: port check ─────────────────────────────────────────────────────
 function checkPort(host, port, timeout = 3000) {
   return new Promise((resolve) => {
     const socket = new net.Socket();
@@ -59,7 +62,7 @@ function checkPort(host, port, timeout = 3000) {
   });
 }
 
-// ── Helper: SSL check ────────────────────────────────────────────────────────
+// ── Helper: SSL check ──────────────────────────────────────────────────────
 function checkSSL(domain) {
   return new Promise((resolve) => {
     const options = { host: domain, port: 443, method: 'HEAD', rejectUnauthorized: false };
@@ -84,11 +87,10 @@ function checkSSL(domain) {
   });
 }
 
-// ── Helper: headers check ────────────────────────────────────────────────────
+// ── Helper: headers check ──────────────────────────────────────────────────
 function checkHeaders(domain) {
   return new Promise((resolve) => {
-    const options = { host: domain, path: '/', method: 'HEAD', timeout: 5000 };
-    const req = https.request({ ...options, port: 443 }, (res) => {
+    const req = https.request({ host: domain, path: '/', method: 'HEAD', port: 443, timeout: 5000 }, (res) => {
       const headers = res.headers;
       resolve({
         statusCode: res.statusCode,
@@ -113,7 +115,7 @@ function checkHeaders(domain) {
   });
 }
 
-// ── Helper: validate input ───────────────────────────────────────────────────
+// ── Helper: classify target ────────────────────────────────────────────────
 function classifyTarget(input) {
   const ipv4Regex = /^(\d{1,3}\.){3}\d{1,3}$/;
   const domainRegex = /^([a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}$/;
@@ -132,7 +134,15 @@ function classifyTarget(input) {
   return { valid: false };
 }
 
-// ── Main scan endpoint ───────────────────────────────────────────────────────
+// ── Helper: risk color ─────────────────────────────────────────────────────
+function getRiskColor(level) {
+  if (level === 'Low') return '#22c55e';
+  if (level === 'Medium') return '#f59e0b';
+  if (level === 'High') return '#f97316';
+  return '#ef4444';
+}
+
+// ── Main scan endpoint ─────────────────────────────────────────────────────
 app.post('/api/scan', async (req, res) => {
   const { domain } = req.body;
   if (!domain) return res.status(400).json({ error: 'Domain or IP is required' });
@@ -154,13 +164,13 @@ app.post('/api/scan', async (req, res) => {
       if (isIP) {
         dnsResult.resolved = true;
         dnsResult.ips = [cleanTarget];
-        try { const h = await dns.reverse(cleanTarget); dnsResult.hostname = h[0]; } catch {}
+        try { const h = await dnsPromises.reverse(cleanTarget); dnsResult.hostname = h[0]; } catch {}
       } else {
-        const ips = await dns.resolve4(cleanTarget);
+        const ips = await dnsPromises.resolve4(cleanTarget);
         dnsResult.resolved = true;
         dnsResult.ips = ips;
-        try { dnsResult.mx = await dns.resolveMx(cleanTarget); } catch {}
-        try { dnsResult.txt = await dns.resolveTxt(cleanTarget); } catch {}
+        try { dnsResult.mx = await dnsPromises.resolveMx(cleanTarget); } catch {}
+        try { dnsResult.txt = await dnsPromises.resolveTxt(cleanTarget); } catch {}
       }
     } catch { dnsResult.error = 'Could not resolve target'; }
 
@@ -211,18 +221,10 @@ app.post('/api/scan', async (req, res) => {
     score = Math.max(0, score);
     const riskLevel = score >= 80 ? 'Low' : score >= 60 ? 'Medium' : score >= 40 ? 'High' : 'Critical';
 
-    // Save to MongoDB
     try {
-      await ScanHistory.create({
-        domain: cleanTarget,
-        targetType: isIP ? 'ip' : 'domain',
-        score,
-        riskLevel,
-        findings
-      });
+      await ScanHistory.create({ domain: cleanTarget, targetType: isIP ? 'ip' : 'domain', score, riskLevel, findings });
     } catch (e) { console.error('DB save error:', e.message); }
 
-    // Auto block if High or Critical
     if (riskLevel === 'Critical' || riskLevel === 'High') {
       try {
         await BlockedUrl.findOneAndUpdate(
@@ -234,12 +236,10 @@ app.post('/api/scan', async (req, res) => {
     }
 
     res.json({
-      domain: cleanTarget,
-      targetType: isIP ? 'ip' : 'domain',
+      domain: cleanTarget, targetType: isIP ? 'ip' : 'domain',
       scannedAt: new Date().toISOString(),
       score, riskLevel, findings,
-      ssl: sslResult,
-      headers: headerResult,
+      ssl: sslResult, headers: headerResult,
       ports: { open: openPorts, all: portResults },
       dns: dnsResult,
       autoBlocked: riskLevel === 'Critical' || riskLevel === 'High'
@@ -250,7 +250,7 @@ app.post('/api/scan', async (req, res) => {
   }
 });
 
-// ── AI analyze endpoint ──────────────────────────────────────────────────────
+// ── AI analyze endpoint ────────────────────────────────────────────────────
 app.post('/api/ai-analyze', async (req, res) => {
   try {
     const { messages } = req.body;
@@ -275,92 +275,91 @@ app.post('/api/ai-analyze', async (req, res) => {
   }
 });
 
-// ── Email report endpoint ────────────────────────────────────────────────────
+// ── Email report endpoint ──────────────────────────────────────────────────
 app.post('/api/send-report', async (req, res) => {
   try {
     const { email, domain, score, riskLevel, findings, ssl, ports } = req.body;
     if (!email) return res.status(400).json({ error: 'Email is required' });
 
-    const scoreColor = score >= 80 ? '#22c55e' : score >= 60 ? '#f59e0b' : score >= 40 ? '#f97316' : '#ef4444';
+    const scoreColor = getRiskColor(riskLevel);
 
     const findingsRows = (findings || []).map(f => `
       <tr>
-        <td style="padding:8px 12px; border-bottom:1px solid #2a2a3e; color:${
-          f.severity === 'Critical' ? '#ef4444' :
-          f.severity === 'High' ? '#f97316' :
-          f.severity === 'Medium' ? '#f59e0b' : '#22c55e'
-        }; font-weight:600;">${f.severity}</td>
-        <td style="padding:8px 12px; border-bottom:1px solid #2a2a3e; color:#94a3b8;">${f.type}</td>
-        <td style="padding:8px 12px; border-bottom:1px solid #2a2a3e; color:#e2e8f0;">${f.detail}</td>
-      </tr>
-    `).join('');
+        <td style="padding:8px 12px;border-bottom:1px solid #334155;color:${getRiskColor(f.severity)};font-weight:600;">${f.severity}</td>
+        <td style="padding:8px 12px;border-bottom:1px solid #334155;color:#94a3b8;">${f.type}</td>
+        <td style="padding:8px 12px;border-bottom:1px solid #334155;color:#e2e8f0;">${f.detail}</td>
+      </tr>`).join('');
 
-    const openPortsList = (ports?.open || []).map(p => `
-      <li style="padding:4px 0; color:#94a3b8;">
-        ${p.port} — <strong style="color:#e2e8f0;">${p.name}</strong>
-        <span style="color:${p.risk === 'Critical' ? '#ef4444' : p.risk === 'High' ? '#f97316' : '#f59e0b'};">
-          (${p.risk})
-        </span>
-      </li>
-    `).join('');
+    const openPortsList = (ports?.open || []).map(p =>
+      `<li style="padding:4px 0;color:#94a3b8;">${p.port} - <strong style="color:#e2e8f0;">${p.name}</strong> <span style="color:${getRiskColor(p.risk)};">(${p.risk})</span></li>`
+    ).join('');
 
     const htmlContent = `
-    <div style="font-family:Arial,sans-serif; max-width:620px; margin:0 auto; background:#0f172a; color:#e2e8f0; border-radius:12px; overflow:hidden;">
-      <div style="background:#1e293b; padding:24px; text-align:center; border-bottom:1px solid #2a2a3e;">
-        <h1 style="color:#6366f1; margin:0; font-size:22px;">🛡️ Cyber Risk Tool</h1>
-        <p style="color:#94a3b8; margin:6px 0 0; font-size:13px;">Automated Security Scan Report</p>
+    <div style="font-family:Arial,sans-serif;max-width:620px;margin:0 auto;background:#0f172a;color:#e2e8f0;border-radius:12px;overflow:hidden;">
+      <div style="background:#1e293b;padding:24px;text-align:center;border-bottom:1px solid #334155;">
+        <h1 style="color:#6366f1;margin:0;font-size:22px;">Shield CyberRisk Assessor</h1>
+        <p style="color:#94a3b8;margin:6px 0 0;font-size:13px;">Automated Security Scan Report</p>
       </div>
       <div style="padding:24px;">
-        <div style="background:#1e293b; border-radius:12px; padding:20px; text-align:center; margin-bottom:20px;">
-          <div style="font-size:13px; color:#94a3b8; margin-bottom:8px;">Security Score for</div>
-          <div style="font-size:20px; font-weight:700; color:#e2e8f0; margin-bottom:12px;">${domain}</div>
-          <div style="font-size:56px; font-weight:800; color:${scoreColor}; line-height:1;">${score}</div>
-          <div style="font-size:13px; color:#94a3b8; margin:4px 0 12px;">out of 100</div>
-          <span style="background:${scoreColor}22; color:${scoreColor}; border:1px solid ${scoreColor}44; padding:4px 16px; border-radius:99px; font-size:13px; font-weight:600;">${riskLevel} Risk</span>
+        <div style="background:#1e293b;border-radius:12px;padding:20px;text-align:center;margin-bottom:20px;">
+          <div style="font-size:13px;color:#94a3b8;margin-bottom:8px;">Security Score for</div>
+          <div style="font-size:20px;font-weight:700;color:#e2e8f0;margin-bottom:12px;">${domain}</div>
+          <div style="font-size:56px;font-weight:800;color:${scoreColor};line-height:1;">${score}</div>
+          <div style="font-size:13px;color:#94a3b8;margin:4px 0 12px;">out of 100</div>
+          <span style="background:${scoreColor}22;color:${scoreColor};border:1px solid ${scoreColor}44;padding:4px 16px;border-radius:99px;font-size:13px;font-weight:600;">${riskLevel} Risk</span>
         </div>
-        <div style="background:#1e293b; border-radius:12px; padding:20px; margin-bottom:20px;">
-          <h3 style="color:#6366f1; margin:0 0 12px; font-size:15px;">SSL Certificate</h3>
-          <p style="color:#94a3b8; margin:0; font-size:13px;">
+
+        <div style="background:#1e293b;border-radius:12px;padding:20px;margin-bottom:20px;">
+          <h3 style="color:#6366f1;margin:0 0 12px;font-size:15px;">SSL Certificate</h3>
+          <p style="color:#94a3b8;margin:0;font-size:13px;">
             ${ssl?.valid
-              ? `✅ Valid — Issued by <strong style="color:#e2e8f0;">${ssl.issuer}</strong>, expires in <strong style="color:#e2e8f0;">${ssl.daysLeft} days</strong>`
-              : `❌ ${ssl?.error || 'No valid SSL certificate'}`}
+              ? `Valid - Issued by <strong style="color:#e2e8f0;">${ssl.issuer}</strong>, expires in <strong style="color:#e2e8f0;">${ssl.daysLeft} days</strong>`
+              : `No valid SSL certificate found`}
           </p>
         </div>
-        ${ports?.open?.length > 0 ? `
-        <div style="background:#1e293b; border-radius:12px; padding:20px; margin-bottom:20px;">
-          <h3 style="color:#6366f1; margin:0 0 12px; font-size:15px;">Open Ports (${ports.open.length})</h3>
-          <ul style="margin:0; padding-left:20px; font-size:13px;">${openPortsList}</ul>
-        </div>` : ''}
-        ${findings?.length > 0 ? `
-        <div style="background:#1e293b; border-radius:12px; padding:20px; margin-bottom:20px;">
-          <h3 style="color:#6366f1; margin:0 0 12px; font-size:15px;">Findings (${findings.length})</h3>
-          <table style="width:100%; border-collapse:collapse; font-size:13px;">
-            <tr style="background:#0f172a;">
-              <th style="padding:8px 12px; text-align:left; color:#6366f1; font-size:12px;">Severity</th>
-              <th style="padding:8px 12px; text-align:left; color:#6366f1; font-size:12px;">Type</th>
-              <th style="padding:8px 12px; text-align:left; color:#6366f1; font-size:12px;">Detail</th>
-            </tr>
-            ${findingsRows}
+
+        <div style="background:#1e293b;border-radius:12px;padding:20px;margin-bottom:20px;">
+          <h3 style="color:#6366f1;margin:0 0 12px;font-size:15px;">Findings (${(findings || []).length})</h3>
+          <table style="width:100%;border-collapse:collapse;">
+            <thead>
+              <tr>
+                <th style="padding:8px 12px;text-align:left;color:#94a3b8;font-size:12px;border-bottom:1px solid #334155;">Severity</th>
+                <th style="padding:8px 12px;text-align:left;color:#94a3b8;font-size:12px;border-bottom:1px solid #334155;">Type</th>
+                <th style="padding:8px 12px;text-align:left;color:#94a3b8;font-size:12px;border-bottom:1px solid #334155;">Detail</th>
+              </tr>
+            </thead>
+            <tbody>${findingsRows}</tbody>
           </table>
-        </div>` : `
-        <div style="background:#1e293b; border-radius:12px; padding:20px; margin-bottom:20px; text-align:center;">
-          <p style="color:#22c55e; margin:0; font-size:14px;">✅ No major findings detected</p>
-        </div>`}
-      </div>
-      <div style="background:#1e293b; padding:16px 24px; text-align:center; border-top:1px solid #2a2a3e;">
-        <p style="color:#64748b; font-size:12px; margin:0;">Generated by Cyber Risk Tool</p>
-        <p style="margin:4px 0 0;">
-          <a href="https://cyber-risk-tool-cz2z.onrender.com" style="color:#6366f1; font-size:12px;">
-            cyber-risk-tool-cz2z.onrender.com
-          </a>
-        </p>
+        </div>
+
+        ${openPortsList ? `
+        <div style="background:#1e293b;border-radius:12px;padding:20px;margin-bottom:20px;">
+          <h3 style="color:#6366f1;margin:0 0 12px;font-size:15px;">Open Ports</h3>
+          <ul style="margin:0;padding-left:20px;">${openPortsList}</ul>
+        </div>` : ''}
+
+        ${riskLevel === 'High' || riskLevel === 'Critical' ? `
+        <div style="background:#7f1d1d22;border:1px solid #ef444444;border-radius:12px;padding:16px;margin-bottom:20px;">
+          <h3 style="color:#ef4444;margin:0 0 8px;font-size:15px;">High Risk Alert</h3>
+          <p style="color:#94a3b8;margin:0;font-size:13px;">
+            This domain has been automatically flagged and added to the blocked list.
+            Accessing this domain may pose a significant security risk to your organization.
+          </p>
+        </div>` : ''}
+
+        <div style="text-align:center;padding-top:16px;border-top:1px solid #334155;">
+          <p style="color:#64748b;font-size:12px;margin:0;">Generated by CyberRisk Assessor</p>
+          <p style="color:#64748b;font-size:12px;margin:4px 0 0;">
+            <a href="https://cyber-risk-tool-cz2z.onrender.com" style="color:#6366f1;">cyber-risk-tool-cz2z.onrender.com</a>
+          </p>
+        </div>
       </div>
     </div>`;
 
     await transporter.sendMail({
-      from: `"Cyber Risk Tool" <${process.env.EMAIL_USER}>`,
+      from: `"CyberRisk Assessor" <${process.env.EMAIL_USER}>`,
       to: email,
-      subject: `🛡️ Security Scan Report: ${domain} — Score ${score}/100`,
+      subject: `Security Scan Report: ${domain} - Score ${score}/100 (${riskLevel} Risk)`,
       html: htmlContent
     });
 
@@ -368,11 +367,11 @@ app.post('/api/send-report', async (req, res) => {
 
   } catch (error) {
     console.error('Email error:', error.message);
-    res.status(500).json({ error: 'Failed to send email. Check EMAIL_USER and EMAIL_PASS in Render environment.' });
+    res.status(500).json({ error: 'Failed to send email: ' + error.message });
   }
 });
 
-// ── Scan history endpoint ────────────────────────────────────────────────────
+// ── Scan history endpoint ──────────────────────────────────────────────────
 app.get('/api/scan-history', async (req, res) => {
   try {
     const history = await ScanHistory.find().sort({ scannedAt: -1 }).limit(50);
@@ -382,7 +381,7 @@ app.get('/api/scan-history', async (req, res) => {
   }
 });
 
-// ── Blocked URLs endpoint ────────────────────────────────────────────────────
+// ── Blocked URLs endpoint ──────────────────────────────────────────────────
 app.get('/api/blocked-urls', async (req, res) => {
   try {
     const blocked = await BlockedUrl.find().sort({ blockedAt: -1 });
@@ -392,7 +391,7 @@ app.get('/api/blocked-urls', async (req, res) => {
   }
 });
 
-// ── Check URL blocked (for Chrome extension) ─────────────────────────────────
+// ── Check URL blocked ──────────────────────────────────────────────────────
 app.get('/api/check-url', async (req, res) => {
   const { domain } = req.query;
   if (!domain) return res.status(400).json({ error: 'Domain required' });
@@ -404,7 +403,7 @@ app.get('/api/check-url', async (req, res) => {
   }
 });
 
-// ── Health check ─────────────────────────────────────────────────────────────
+// ── Health check ───────────────────────────────────────────────────────────
 app.get('/', (req, res) => {
   res.json({ message: 'Cyber Risk Tool API is running' });
 });
