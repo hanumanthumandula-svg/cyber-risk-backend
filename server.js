@@ -41,7 +41,7 @@ const blockedUrlSchema = new mongoose.Schema({
 const BlockedUrl = mongoose.model('BlockedUrl', blockedUrlSchema);
 
 // ── Helper: port check ─────────────────────────────────────────────────────
-function checkPort(host, port, timeout = 3000) {
+function checkPort(host, port, timeout = 1500) {
   return new Promise((resolve) => {
     const socket = new net.Socket();
     socket.setTimeout(timeout);
@@ -467,3 +467,13 @@ app.get('/', (req, res) => {
 
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+// Keep Render awake - ping every 10 minutes
+const BACKEND_URL = process.env.RENDER_EXTERNAL_URL || 'http://localhost:5000';
+setInterval(async () => {
+  try {
+    await fetch(`${BACKEND_URL}/`);
+    console.log('Keep-alive ping sent');
+  } catch (e) {
+    console.log('Keep-alive failed:', e.message);
+  }
+}, 10 * 60 * 1000);
